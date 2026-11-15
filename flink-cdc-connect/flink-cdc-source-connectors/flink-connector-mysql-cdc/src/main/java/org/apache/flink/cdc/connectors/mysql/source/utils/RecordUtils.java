@@ -31,6 +31,7 @@ import io.debezium.document.DocumentReader;
 import io.debezium.relational.TableId;
 import io.debezium.relational.history.HistoryRecord;
 import io.debezium.util.SchemaNameAdjuster;
+import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
@@ -141,9 +142,22 @@ public class RecordUtils {
                                     LOG.warn(
                                             "The updated chunk key is out of the split range. Cannot provide exactly-once semantics.");
                                 }
+                            } else {
+                                // For tables with a primary key, Debezium carries the new
+                                // (after-image) primary key in the record key. When the primary key
+                                // itself is updated, the snapshot record is still indexed by the
+                                // old (before-image) key. Remove that stale entry first, otherwise
+                                // both the old and the new row would be emitted and the downstream
+                                // observes two records for a single primary-key update.
+                                Struct oldRow =
+                                        ((Struct) binlogRecord.value())
+                                                .getStruct(Envelope.FieldName.BEFORE);
+                                if (oldRow != null) {
+                                    snapshotRecords.remove(
+                                            projectToKeySchema(binlogRecord.keySchema(), oldRow));
+                                }
                             }
-                            // If the chunk key changed, we still send here
-                            // This will cause the at-least-once semantics
+                            // Upsert the row under the (possibly new) key.
                             upsertBinlog(
                                     snapshotRecords,
                                     binlogRecord,
@@ -218,6 +232,19 @@ public class RecordUtils {
         Struct targetStruct = value.getStruct(beforeOrAfter);
         Instant fetchTs = Instant.ofEpochMilli((Long) source.get(Envelope.FieldName.TIMESTAMP));
         return envelope.read(targetStruct, source, fetchTs);
+    }
+
+    /**
+     * Projects the primary-key columns of a full row struct onto the record key schema, so the
+     * resulting struct is {@link Struct#equals(Object)} compatible with the keys stored in the
+     * snapshot records collection.
+     */
+    private static Struct projectToKeySchema(Schema keySchema, Struct row) {
+        Struct key = new Struct(keySchema);
+        for (Field keyField : keySchema.fields()) {
+            key.put(keyField.name(), row.get(keyField.name()));
+        }
+        return key;
     }
 
     /**
